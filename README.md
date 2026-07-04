@@ -131,7 +131,8 @@ Resiliency levels:
         "networkmanager:DescribeGlobalNetworks",
         "networkmanager:ListCoreNetworks",
         "networkmanager:ListAttachments",
-        "networkmanager:ListPeerings"
+        "networkmanager:ListPeerings",
+        "cloudwatch:GetMetricData"
       ],
       "Resource": "*"
     }

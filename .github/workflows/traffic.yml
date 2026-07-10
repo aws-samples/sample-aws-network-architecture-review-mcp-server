@@ -22,10 +22,12 @@ jobs:
         run: |
           DATE=$(date -u +%Y-%m-%d)
           mkdir -p data
+
           gh api "repos/${REPO}/traffic/views" > "data/views_${DATE}.json"
           gh api "repos/${REPO}/traffic/clones" > "data/clones_${DATE}.json"
           gh api "repos/${REPO}/traffic/popular/referrers" > "data/referrers_${DATE}.json"
           gh api "repos/${REPO}/traffic/popular/paths" > "data/paths_${DATE}.json"
+
           echo "Traffic snapshot saved for ${DATE}"
 
       - name: Commit and push

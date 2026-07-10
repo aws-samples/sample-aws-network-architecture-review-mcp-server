@@ -1,0 +1,37 @@
+name: Track Traffic
+
+on:
+  schedule:
+    - cron: '0 23 * * *'
+  workflow_dispatch:
+
+jobs:
+  traffic:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: traffic-data
+
+      - name: Fetch and store traffic data
+        env:
+          GH_TOKEN: ${{ secrets.TRAFFIC_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          mkdir -p data
+          gh api "repos/${REPO}/traffic/views" > "data/views_${DATE}.json"
+          gh api "repos/${REPO}/traffic/clones" > "data/clones_${DATE}.json"
+          gh api "repos/${REPO}/traffic/popular/referrers" > "data/referrers_${DATE}.json"
+          gh api "repos/${REPO}/traffic/popular/paths" > "data/paths_${DATE}.json"
+          echo "Traffic snapshot saved for ${DATE}"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || git commit -m "traffic: $(date -u +%Y-%m-%d)"
+          git push

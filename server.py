@@ -1,7 +1,7 @@
 """
 AWS Network Architecture Review MCP Server
 Public version — uses standard AWS SDK (boto3) only.
-No internal tools, no Midway auth, no Skyhook/Dante dependencies.
+Uses only standard boto3 APIs — no proprietary dependencies.
 
 Provides automated DX/TGW/Cloud WAN architecture assessments,
 resiliency scoring, and BGP status analysis.

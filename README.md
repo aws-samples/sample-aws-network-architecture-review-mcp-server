@@ -211,10 +211,19 @@ No configuration needed — credentials are auto-detected from the instance meta
 
 ## Security
 
-- Uses standard AWS credential chain (profiles, environment variables, IAM roles)
-- Read-only operations — no mutations
-- No customer data stored or transmitted outside your AWS account
-- No external service dependencies
+### Defense in Depth
+
+| Layer | Enforcement |
+|-------|-------------|
+| **Application** | All tools use only `Describe*`, `List*`, `Get*`, `Search*` calls |
+| **IAM** (recommended) | Run with the [least-privilege role above](#required-iam-permissions) — not `AdministratorAccess` or broad `ReadOnlyAccess` |
+| **SCP** (optional) | Deny `Create*`/`Delete*`/`Update*` on DX/TGW at the OU level |
+
+> **Why this matters:** If a prompt injection tricks the AI client into calling a mutating API, the IAM role is your last line of defense. Scope credentials to only what the tools need.
+
+- ✅ No mutations in code
+- ✅ No data stored or exfiltrated
+- ✅ No external dependencies beyond AWS APIs
 
 ## License
 

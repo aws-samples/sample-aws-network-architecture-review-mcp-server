@@ -716,6 +716,26 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         except Exception:
             pass
 
+    # ─── CloudWatch Alarms for DX ───
+    all_dx_alarms = []
+    try:
+        paginator = cw.get_paginator("describe_alarms")
+        for page in paginator.paginate():
+            for alarm in page.get("MetricAlarms", []):
+                if alarm.get("Namespace") == "AWS/DX":
+                    all_dx_alarms.append({
+                        "name": alarm.get("AlarmName"),
+                        "state": alarm.get("StateValue"),
+                        "metric": alarm.get("MetricName"),
+                        "threshold": alarm.get("Threshold"),
+                        "comparison": alarm.get("ComparisonOperator"),
+                        "connection_id": next(
+                            (d["Value"] for d in alarm.get("Dimensions", []) if d["Name"] == "ConnectionId"), None
+                        ),
+                    })
+    except Exception:
+        pass
+
     # ─── TGW Layer ───
     tgws = ec2.describe_transit_gateways().get("TransitGateways", [])
     tgw_attachments = ec2.describe_transit_gateway_attachments().get("TransitGatewayAttachments", []) if tgws else []
@@ -832,13 +852,23 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         "cloud_wan": cloudwan,
         "vpc_endpoints": endpoint_summary,
         "vpcs": {"total": len(vpcs)},
-        "resiliency": _assess_resiliency(connections, vifs, gateways),
+        "resiliency": _assess_architecture_resiliency(
+            connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan
+        ),
         "redundancy": {
             "dx_locations": len(locations),
             "dx_connections": len(connections),
             "vpn_backup": len(vpns) > 0,
             "macsec_capable": any(c.get("macSecCapable") for c in connections),
             "macsec_enabled": any(c.get("macSecKeys") for c in connections),
+        },
+        "cloudwatch_alarms": {
+            "total_dx_alarms": len(all_dx_alarms),
+            "alarms_in_alarm_state": [a for a in all_dx_alarms if a["state"] == "ALARM"],
+            "alarms_in_ok_state": len([a for a in all_dx_alarms if a["state"] == "OK"]),
+            "alarms_insufficient_data": len([a for a in all_dx_alarms if a["state"] == "INSUFFICIENT_DATA"]),
+            "all_alarms": all_dx_alarms,
+            "missing_recommended": _check_missing_alarms(connections, all_dx_alarms),
         },
     }
     return json.dumps(result, indent=2, default=str)
@@ -962,6 +992,162 @@ def _assess_resiliency(connections, vifs, gateways):
         level = "LOW (Single Location)"
 
     return {"resiliency_level": level, "score": max(0, score), "findings": findings}
+
+
+def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan):
+    """Comprehensive resiliency assessment across DX, TGW, VPN, Cloud WAN."""
+    findings = []
+    score = 0
+    max_score = 0
+
+    # ─── Direct Connect (40 points max) ───
+    if connections:
+        max_score += 40
+        locations = [c.get("location", "") for c in connections if c.get("connectionState") == "available"]
+        unique_locations = set(locations)
+
+        # Location diversity (20 pts)
+        if len(unique_locations) >= 2:
+            score += 20
+            findings.append({"severity": "OK", "check": "DX Location Diversity", "finding": f"Connections span {len(unique_locations)} locations"})
+        else:
+            findings.append({"severity": "CRITICAL", "check": "DX Location Diversity", "finding": f"All connections in single location: {list(unique_locations)}"})
+
+        # Connection redundancy (10 pts)
+        location_counts = defaultdict(int)
+        for c in connections:
+            if c.get("connectionState") == "available":
+                location_counts[c.get("location", "unknown")] += 1
+        if all(count >= 2 for count in location_counts.values()):
+            score += 10
+            findings.append({"severity": "OK", "check": "DX Connection Redundancy", "finding": "All locations have 2+ connections"})
+        else:
+            single_locs = [loc for loc, count in location_counts.items() if count < 2]
+            findings.append({"severity": "HIGH", "check": "DX Connection Redundancy", "finding": f"Single connection at: {single_locs}"})
+
+        # BGP health (10 pts)
+        bgp = _analyze_bgp(vifs)
+        if bgp["total_peers"] > 0 and bgp["peers_down"] == 0:
+            score += 10
+            findings.append({"severity": "OK", "check": "BGP Health", "finding": f"All {bgp['total_peers']} BGP peers UP"})
+        elif bgp["total_peers"] > 0:
+            score += max(0, 10 - (bgp["peers_down"] * 3))
+            findings.append({"severity": "HIGH", "check": "BGP Health", "finding": f"{bgp['peers_down']}/{bgp['total_peers']} BGP peers DOWN"})
+        else:
+            findings.append({"severity": "MEDIUM", "check": "BGP Health", "finding": "No BGP peers configured"})
+    else:
+        findings.append({"severity": "INFO", "check": "DX Presence", "finding": "No DX connections — DX resiliency not applicable"})
+
+    # ─── Transit Gateway (25 points max) ───
+    if tgws:
+        max_score += 25
+
+        # TGW exists and available (10 pts)
+        available_tgws = [t for t in tgws if t.get("State") == "available" or t.get("state") == "available"]
+        if available_tgws:
+            score += 10
+            findings.append({"severity": "OK", "check": "TGW Availability", "finding": f"{len(available_tgws)} TGW(s) available"})
+        else:
+            findings.append({"severity": "CRITICAL", "check": "TGW Availability", "finding": "No TGWs in available state"})
+
+        # Multiple attachment types (10 pts) — indicates redundant paths
+        attachment_types = set()
+        for a in tgw_attachments:
+            attachment_types.add(a.get("ResourceType", a.get("resourceType", "")))
+        if len(attachment_types) >= 2:
+            score += 10
+            findings.append({"severity": "OK", "check": "TGW Path Diversity", "finding": f"Multiple attachment types: {list(attachment_types)}"})
+        elif len(attachment_types) == 1:
+            score += 5
+            findings.append({"severity": "MEDIUM", "check": "TGW Path Diversity", "finding": f"Single attachment type only: {list(attachment_types)}"})
+
+        # TGW peering for multi-region (5 pts)
+        peering_attachments = [a for a in tgw_attachments if a.get("ResourceType") == "peering" or a.get("resourceType") == "peering"]
+        if peering_attachments:
+            score += 5
+            findings.append({"severity": "OK", "check": "TGW Peering", "finding": f"{len(peering_attachments)} peering attachment(s) for cross-region connectivity"})
+    else:
+        findings.append({"severity": "INFO", "check": "TGW Presence", "finding": "No Transit Gateways deployed"})
+
+    # ─── VPN Backup (15 points max) ───
+    max_score += 15
+    if vpn_details:
+        tunnels_up = sum(v.get("tunnels_up", 0) for v in vpn_details)
+        tunnels_total = sum(v.get("tunnels_total", 0) for v in vpn_details)
+        if tunnels_up > 0:
+            score += 15
+            findings.append({"severity": "OK", "check": "VPN Backup", "finding": f"VPN active: {tunnels_up}/{tunnels_total} tunnels UP"})
+        else:
+            score += 5  # VPN exists but tunnels down
+            findings.append({"severity": "HIGH", "check": "VPN Backup", "finding": f"VPN configured but 0/{tunnels_total} tunnels UP"})
+    elif connections:
+        # DX exists but no VPN backup
+        findings.append({"severity": "MEDIUM", "check": "VPN Backup", "finding": "No VPN backup for DX — single connectivity method"})
+    else:
+        findings.append({"severity": "INFO", "check": "VPN Backup", "finding": "No VPN connections"})
+
+    # ─── Cloud WAN (20 points max) ───
+    if cloudwan and cloudwan.get("core_networks", 0) > 0:
+        max_score += 20
+
+        # Cloud WAN active (10 pts)
+        score += 10
+        findings.append({"severity": "OK", "check": "Cloud WAN", "finding": f"Cloud WAN active: {cloudwan.get('core_networks')} core network(s), {cloudwan.get('attachments', 0)} attachments"})
+
+        # Multi-region edge locations (10 pts)
+        edge_locations = cloudwan.get("edge_locations", [])
+        if len(edge_locations) >= 2:
+            score += 10
+            findings.append({"severity": "OK", "check": "Cloud WAN Multi-Region", "finding": f"Edge locations: {edge_locations}"})
+        elif len(edge_locations) == 1:
+            score += 5
+            findings.append({"severity": "MEDIUM", "check": "Cloud WAN Multi-Region", "finding": f"Single edge location: {edge_locations}"})
+
+    # ─── Calculate final score ───
+    if max_score == 0:
+        # No networking resources at all
+        return {
+            "resiliency_level": "N/A",
+            "score": 0,
+            "max_possible_score": 0,
+            "score_pct": 0,
+            "findings": [{"severity": "INFO", "check": "Architecture", "finding": "No hybrid connectivity resources found (no DX, TGW, or Cloud WAN)"}],
+        }
+
+    score_pct = round((score / max_score) * 100)
+
+    if score_pct >= 80:
+        level = "HIGH"
+    elif score_pct >= 50:
+        level = "MEDIUM"
+    elif score_pct > 0:
+        level = "LOW"
+    else:
+        level = "CRITICAL"
+
+    return {
+        "resiliency_level": level,
+        "score": score,
+        "max_possible_score": max_score,
+        "score_pct": score_pct,
+        "findings": findings,
+    }
+
+
+def _check_missing_alarms(connections, existing_alarms):
+    """Check if recommended DX alarms exist for each connection."""
+    recommended = ["ConnectionState", "ConnectionBpsEgress", "ConnectionBpsIngress", "ConnectionErrorCount"]
+    missing = []
+    alarm_metrics = {(a["connection_id"], a["metric"]) for a in existing_alarms}
+
+    for conn in connections:
+        cid = conn.get("connectionId")
+        if not cid:
+            continue
+        for metric in recommended:
+            if (cid, metric) not in alarm_metrics:
+                missing.append({"connection_id": cid, "missing_alarm": metric})
+    return missing
 
 
 def _count_by_key(items, key):

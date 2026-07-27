@@ -25,7 +25,7 @@ Any MCP-compatible client can use this server as a data source:
 - [Cursor](https://cursor.sh)
 - [VS Code + GitHub Copilot](https://code.visualstudio.com/)
 
-## Tools (13)
+## Tools (14)
 
 | Tool | Description |
 |------|-------------|
@@ -41,7 +41,7 @@ Any MCP-compatible client can use this server as a data source:
 | `get_virtual_gateway_details` | VGW details and VPC attachments |
 | `analyze_cloudwan_topology` | Cloud WAN global/core networks, attachments, peerings |
 | `get_vpc_endpoints` | VPC endpoints summary with pattern detection |
-| `network_architecture_summary` | Complete architecture discovery combining all layers |
+| `network_architecture_summary` | Complete architecture discovery combining all layers, CloudWatch alarms, and resiliency scoring |
 
 ## Quick Start
 
@@ -93,7 +93,9 @@ Add to your MCP client configuration:
 
 ## Resiliency Scoring
 
-The `check_dx_resiliency` tool scores across 5 dimensions:
+### DX Resiliency (`check_dx_resiliency`)
+
+The `check_dx_resiliency` tool scores Direct Connect across 5 dimensions:
 
 | Check | Severity | Score Impact |
 |-------|----------|--------------|
@@ -107,6 +109,29 @@ Resiliency levels:
 - **HIGH (Maximum Resiliency)**: 2+ locations, 2+ connections per location
 - **MEDIUM (High Resiliency)**: 2+ locations, some with single connection
 - **LOW (Single Location)**: All connections in one facility
+
+### Architecture Resiliency (`network_architecture_summary`)
+
+The summary tool provides a holistic resiliency score across all connectivity layers:
+
+| Component | Max Points | Checks |
+|-----------|-----------|--------|
+| Direct Connect | 40 | Location diversity (20), connection redundancy (10), BGP health (10) |
+| Transit Gateway | 25 | Availability (10), path diversity (10), peering (5) |
+| VPN Backup | 15 | Tunnels UP (15), exists but down (5) |
+| Cloud WAN | 20 | Active core network (10), multi-region edges (10) |
+
+The `max_possible_score` is dynamic — only deployed components contribute to the maximum. Levels: HIGH (≥80%), MEDIUM (≥50%), LOW (>0%), CRITICAL (0%).
+
+### CloudWatch Alarm Assessment
+
+The summary also checks for recommended DX monitoring alarms per connection:
+- `ConnectionState` — link up/down
+- `ConnectionBpsEgress` — outbound bandwidth
+- `ConnectionBpsIngress` — inbound bandwidth
+- `ConnectionErrorCount` — CRC/frame errors
+
+Missing alarms are reported in `cloudwatch_alarms.missing_recommended`.
 
 ## Required IAM Permissions
 
@@ -132,7 +157,8 @@ Resiliency levels:
         "networkmanager:ListCoreNetworks",
         "networkmanager:ListAttachments",
         "networkmanager:ListPeerings",
-        "cloudwatch:GetMetricData"
+        "cloudwatch:GetMetricData",
+        "cloudwatch:DescribeAlarms"
       ],
       "Resource": "*"
     }

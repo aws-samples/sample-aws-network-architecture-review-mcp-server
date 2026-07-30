@@ -11,6 +11,7 @@ import json
 from collections import defaultdict
 from mcp.server.fastmcp import FastMCP
 import boto3
+from botocore.exceptions import ClientError
 
 mcp = FastMCP("aws-network-architecture-review")
 
@@ -671,25 +672,32 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
     cw = get_client("cloudwatch", region)
     nm = get_client("networkmanager", region)
 
-    # ─── DX Layer ───
-    connections = dx.describe_connections().get("connections", [])
-    vifs = dx.describe_virtual_interfaces().get("virtualInterfaces", [])
-    gateways = dx.describe_direct_connect_gateways().get("directConnectGateways", [])
+    # Per-layer failures land here as {layer: reason} instead of aborting the
+    # whole summary — a denied layer must stay distinguishable from an absent one.
+    layer_errors = {}
 
-    # DX Gateway associations
-    gw_details = []
-    for gw in gateways:
-        gw_id = gw.get("directConnectGatewayId")
-        assocs = dx.describe_direct_connect_gateway_associations(
-            directConnectGatewayId=gw_id
-        ).get("directConnectGatewayAssociations", [])
-        gw_details.append({
-            "id": gw_id,
-            "name": gw.get("directConnectGatewayName"),
-            "asn": gw.get("amazonSideAsn"),
-            "associations": len(assocs),
-            "allowed_prefixes": sum(len(a.get("allowedPrefixesToDirectConnectGateway", [])) for a in assocs),
-        })
+    # ─── DX Layer ───
+    connections, vifs, gateways, gw_details = [], [], [], []
+    try:
+        connections = dx.describe_connections().get("connections", [])
+        vifs = dx.describe_virtual_interfaces().get("virtualInterfaces", [])
+        gateways = dx.describe_direct_connect_gateways().get("directConnectGateways", [])
+
+        # DX Gateway associations
+        for gw in gateways:
+            gw_id = gw.get("directConnectGatewayId")
+            assocs = dx.describe_direct_connect_gateway_associations(
+                directConnectGatewayId=gw_id
+            ).get("directConnectGatewayAssociations", [])
+            gw_details.append({
+                "id": gw_id,
+                "name": gw.get("directConnectGatewayName"),
+                "asn": gw.get("amazonSideAsn"),
+                "associations": len(assocs),
+                "allowed_prefixes": sum(len(a.get("allowedPrefixesToDirectConnectGateway", [])) for a in assocs),
+            })
+    except Exception as e:
+        layer_errors["dx"] = _error_label(e)
 
     # ─── DX CloudWatch Metrics ───
     dx_metrics = []
@@ -713,8 +721,8 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                 if vals:
                     metrics[r["Id"]] = round(sum(vals) / len(vals) / 1_000_000, 2)
             dx_metrics.append({"connection_id": cid, "avg_ingress_mbps": metrics.get("ingress", 0), "avg_egress_mbps": metrics.get("egress", 0)})
-        except Exception:
-            pass
+        except Exception as e:
+            layer_errors.setdefault("dx_metrics", _error_label(e))
 
     # ─── CloudWatch Alarms for DX ───
     all_dx_alarms = []
@@ -733,47 +741,57 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                             (d["Value"] for d in alarm.get("Dimensions", []) if d["Name"] == "ConnectionId"), None
                         ),
                     })
-    except Exception:
-        pass
+    except Exception as e:
+        layer_errors["cloudwatch_alarms"] = _error_label(e)
 
     # ─── TGW Layer ───
-    tgws = ec2.describe_transit_gateways().get("TransitGateways", [])
-    tgw_attachments = ec2.describe_transit_gateway_attachments().get("TransitGatewayAttachments", []) if tgws else []
+    tgws, tgw_attachments, tgw_details = [], [], []
+    try:
+        tgws = ec2.describe_transit_gateways().get("TransitGateways", [])
+        tgw_attachments = ec2.describe_transit_gateway_attachments().get("TransitGatewayAttachments", []) if tgws else []
 
-    tgw_details = []
-    for t in tgws:
-        tgw_details.append({
-            "id": t.get("TransitGatewayId"),
-            "name": _get_name_tag(t.get("Tags", [])),
-            "asn": t.get("Options", {}).get("AmazonSideAsn"),
-            "state": t.get("State"),
-        })
+        for t in tgws:
+            tgw_details.append({
+                "id": t.get("TransitGatewayId"),
+                "name": _get_name_tag(t.get("Tags", [])),
+                "asn": t.get("Options", {}).get("AmazonSideAsn"),
+                "state": t.get("State"),
+            })
+    except Exception as e:
+        layer_errors["tgw"] = _error_label(e)
 
     # ─── VPN Layer ───
-    vpns = ec2.describe_vpn_connections().get("VpnConnections", [])
-    vpn_details = []
-    for v in vpns:
-        tunnels = v.get("VgwTelemetry", [])
-        vpn_details.append({
-            "vpn_id": v.get("VpnConnectionId"),
-            "name": _get_name_tag(v.get("Tags", [])),
-            "state": v.get("State"),
-            "tgw_id": v.get("TransitGatewayId"),
-            "tunnels_up": sum(1 for t in tunnels if t.get("Status") == "UP"),
-            "tunnels_total": len(tunnels),
-        })
+    vpns, vpn_details = [], []
+    try:
+        vpns = ec2.describe_vpn_connections().get("VpnConnections", [])
+        for v in vpns:
+            tunnels = v.get("VgwTelemetry", [])
+            vpn_details.append({
+                "vpn_id": v.get("VpnConnectionId"),
+                "name": _get_name_tag(v.get("Tags", [])),
+                "state": v.get("State"),
+                "tgw_id": v.get("TransitGatewayId"),
+                "tunnels_up": sum(1 for t in tunnels if t.get("Status") == "UP"),
+                "tunnels_total": len(tunnels),
+            })
+    except Exception as e:
+        layer_errors["vpn"] = _error_label(e)
 
     # ─── VGW Layer ───
-    vgws = ec2.describe_vpn_gateways().get("VpnGateways", [])
-    vgw_details = [
-        {
-            "id": v.get("VpnGatewayId"),
-            "name": _get_name_tag(v.get("Tags", [])),
-            "asn": v.get("AmazonSideAsn"),
-            "attached_vpcs": [a.get("VpcId") for a in v.get("VpcAttachments", []) if a.get("State") == "attached"],
-        }
-        for v in vgws
-    ]
+    vgw_details = []
+    try:
+        vgws = ec2.describe_vpn_gateways().get("VpnGateways", [])
+        vgw_details = [
+            {
+                "id": v.get("VpnGatewayId"),
+                "name": _get_name_tag(v.get("Tags", [])),
+                "asn": v.get("AmazonSideAsn"),
+                "attached_vpcs": [a.get("VpcId") for a in v.get("VpcAttachments", []) if a.get("State") == "attached"],
+            }
+            for v in vgws
+        ]
+    except Exception as e:
+        layer_errors["vgw"] = _error_label(e)
 
     # ─── Cloud WAN Layer ───
     cloudwan = {}
@@ -789,8 +807,8 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                 "attachments_by_type": _count_by_key(cw_attachments, "AttachmentType"),
                 "edge_locations": list(set(a.get("EdgeLocation", "") for a in cw_attachments)),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        layer_errors["cloud_wan"] = _error_label(e)
 
     # ─── VPC Endpoints ───
     endpoints = []
@@ -798,8 +816,8 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         paginator = ec2.get_paginator("describe_vpc_endpoints")
         for page in paginator.paginate():
             endpoints.extend(page.get("VpcEndpoints", []))
-    except Exception:
-        pass
+    except Exception as e:
+        layer_errors["vpc_endpoints"] = _error_label(e)
 
     endpoint_summary = {}
     if endpoints:
@@ -809,7 +827,11 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         endpoint_summary = {"total": len(endpoints), "by_type": dict(by_type)}
 
     # ─── VPCs ───
-    vpcs = ec2.describe_vpcs().get("Vpcs", [])
+    vpcs = []
+    try:
+        vpcs = ec2.describe_vpcs().get("Vpcs", [])
+    except Exception as e:
+        layer_errors["vpcs"] = _error_label(e)
 
     # ─── Detect Pattern ───
     if tgws and connections and cloudwan:
@@ -830,6 +852,7 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
     result = {
         "region": region,
         "connectivity_pattern": pattern,
+        "layer_errors": layer_errors,
         "dx": {
             "connections": [_format_connection(c) for c in connections],
             "virtual_interfaces": [_format_vif(v) for v in vifs],
@@ -853,7 +876,8 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         "vpc_endpoints": endpoint_summary,
         "vpcs": {"total": len(vpcs)},
         "resiliency": _assess_architecture_resiliency(
-            connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan
+            connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan,
+            layer_errors=layer_errors,
         ),
         "redundancy": {
             "dx_locations": len(locations),
@@ -994,11 +1018,20 @@ def _assess_resiliency(connections, vifs, gateways):
     return {"resiliency_level": level, "score": max(0, score), "findings": findings}
 
 
-def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan):
-    """Comprehensive resiliency assessment across DX, TGW, VPN, Cloud WAN."""
+def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan, layer_errors=None):
+    """Comprehensive resiliency assessment across DX, TGW, VPN, Cloud WAN.
+
+    layer_errors maps layer name -> failure reason for layers that could not be
+    queried; those layers are reported as unassessed rather than treated as
+    absent, so a permissions gap never silently improves the score.
+    """
     findings = []
     score = 0
     max_score = 0
+
+    layer_errors = layer_errors or {}
+    for layer, reason in sorted(layer_errors.items()):
+        findings.append({"severity": "INFO", "check": "Layer Access", "finding": f"{layer} could not be assessed: {reason}"})
 
     # ─── Direct Connect (40 points max) ───
     if connections:
@@ -1035,7 +1068,7 @@ def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attac
             findings.append({"severity": "HIGH", "check": "BGP Health", "finding": f"{bgp['peers_down']}/{bgp['total_peers']} BGP peers DOWN"})
         else:
             findings.append({"severity": "MEDIUM", "check": "BGP Health", "finding": "No BGP peers configured"})
-    else:
+    elif "dx" not in layer_errors:
         findings.append({"severity": "INFO", "check": "DX Presence", "finding": "No DX connections — DX resiliency not applicable"})
 
     # ─── Transit Gateway (25 points max) ───
@@ -1066,25 +1099,26 @@ def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attac
         if peering_attachments:
             score += 5
             findings.append({"severity": "OK", "check": "TGW Peering", "finding": f"{len(peering_attachments)} peering attachment(s) for cross-region connectivity"})
-    else:
+    elif "tgw" not in layer_errors:
         findings.append({"severity": "INFO", "check": "TGW Presence", "finding": "No Transit Gateways deployed"})
 
     # ─── VPN Backup (15 points max) ───
-    max_score += 15
-    if vpn_details:
-        tunnels_up = sum(v.get("tunnels_up", 0) for v in vpn_details)
-        tunnels_total = sum(v.get("tunnels_total", 0) for v in vpn_details)
-        if tunnels_up > 0:
-            score += 15
-            findings.append({"severity": "OK", "check": "VPN Backup", "finding": f"VPN active: {tunnels_up}/{tunnels_total} tunnels UP"})
+    if "vpn" not in layer_errors:
+        max_score += 15
+        if vpn_details:
+            tunnels_up = sum(v.get("tunnels_up", 0) for v in vpn_details)
+            tunnels_total = sum(v.get("tunnels_total", 0) for v in vpn_details)
+            if tunnels_up > 0:
+                score += 15
+                findings.append({"severity": "OK", "check": "VPN Backup", "finding": f"VPN active: {tunnels_up}/{tunnels_total} tunnels UP"})
+            else:
+                score += 5  # VPN exists but tunnels down
+                findings.append({"severity": "HIGH", "check": "VPN Backup", "finding": f"VPN configured but 0/{tunnels_total} tunnels UP"})
+        elif connections:
+            # DX exists but no VPN backup
+            findings.append({"severity": "MEDIUM", "check": "VPN Backup", "finding": "No VPN backup for DX — single connectivity method"})
         else:
-            score += 5  # VPN exists but tunnels down
-            findings.append({"severity": "HIGH", "check": "VPN Backup", "finding": f"VPN configured but 0/{tunnels_total} tunnels UP"})
-    elif connections:
-        # DX exists but no VPN backup
-        findings.append({"severity": "MEDIUM", "check": "VPN Backup", "finding": "No VPN backup for DX — single connectivity method"})
-    else:
-        findings.append({"severity": "INFO", "check": "VPN Backup", "finding": "No VPN connections"})
+            findings.append({"severity": "INFO", "check": "VPN Backup", "finding": "No VPN connections"})
 
     # ─── Cloud WAN (20 points max) ───
     if cloudwan and cloudwan.get("core_networks", 0) > 0:
@@ -1105,13 +1139,16 @@ def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attac
 
     # ─── Calculate final score ───
     if max_score == 0:
-        # No networking resources at all
+        # No networking resources visible — findings still carry any Layer
+        # Access entries so "nothing deployed" and "nothing visible" read apart
+        findings.append({"severity": "INFO", "check": "Architecture", "finding": "No hybrid connectivity resources found (no DX, TGW, or Cloud WAN)"})
         return {
             "resiliency_level": "N/A",
             "score": 0,
             "max_possible_score": 0,
             "score_pct": 0,
-            "findings": [{"severity": "INFO", "check": "Architecture", "finding": "No hybrid connectivity resources found (no DX, TGW, or Cloud WAN)"}],
+            "unassessed_layers": sorted(layer_errors),
+            "findings": findings,
         }
 
     score_pct = round((score / max_score) * 100)
@@ -1130,6 +1167,7 @@ def _assess_architecture_resiliency(connections, vifs, gateways, tgws, tgw_attac
         "score": score,
         "max_possible_score": max_score,
         "score_pct": score_pct,
+        "unassessed_layers": sorted(layer_errors),
         "findings": findings,
     }
 
@@ -1148,6 +1186,15 @@ def _check_missing_alarms(connections, existing_alarms):
             if (cid, metric) not in alarm_metrics:
                 missing.append({"connection_id": cid, "missing_alarm": metric})
     return missing
+
+
+def _error_label(e):
+    """Compact label for a failed layer query, keeping AccessDenied
+    distinguishable from other failures (and from genuine absence)."""
+    if isinstance(e, ClientError):
+        code = e.response.get("Error", {}).get("Code", "ClientError")
+        return f"{code} on {getattr(e, 'operation_name', 'unknown operation')}"
+    return type(e).__name__
 
 
 def _count_by_key(items, key):

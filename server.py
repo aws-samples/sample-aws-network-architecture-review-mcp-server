@@ -691,6 +691,10 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
             "allowed_prefixes": sum(len(a.get("allowedPrefixesToDirectConnectGateway", [])) for a in assocs),
         })
 
+    # Sources that failed are recorded here rather than silently returning empty
+    # results, which would otherwise read as real findings (e.g. "no alarms").
+    data_errors = []
+
     # ─── DX CloudWatch Metrics ───
     dx_metrics = []
     end_time = datetime.now(timezone.utc)
@@ -713,8 +717,9 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                 if vals:
                     metrics[r["Id"]] = round(sum(vals) / len(vals) / 1_000_000, 2)
             dx_metrics.append({"connection_id": cid, "avg_ingress_mbps": metrics.get("ingress", 0), "avg_egress_mbps": metrics.get("egress", 0)})
-        except Exception:
-            pass
+        except Exception as e:
+            dx_metrics.append({"connection_id": cid, "error": str(e)})
+            data_errors.append({"source": "cloudwatch:GetMetricData", "resource": cid, "error": str(e)})
 
     # ─── CloudWatch Alarms for DX ───
     all_dx_alarms = []
@@ -733,8 +738,11 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                             (d["Value"] for d in alarm.get("Dimensions", []) if d["Name"] == "ConnectionId"), None
                         ),
                     })
-    except Exception:
-        pass
+    except Exception as e:
+        alarms_error = str(e)
+        data_errors.append({"source": "cloudwatch:DescribeAlarms", "error": alarms_error})
+    else:
+        alarms_error = None
 
     # ─── TGW Layer ───
     tgws = ec2.describe_transit_gateways().get("TransitGateways", [])
@@ -789,8 +797,13 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
                 "attachments_by_type": _count_by_key(cw_attachments, "AttachmentType"),
                 "edge_locations": list(set(a.get("EdgeLocation", "") for a in cw_attachments)),
             }
-    except Exception:
-        pass
+    except Exception as e:
+        # cloudwan stays {} so pattern detection and scoring are unchanged; the
+        # error is reported in the output so "no Cloud WAN" is not assumed.
+        cloudwan_error = str(e)
+        data_errors.append({"source": "networkmanager", "error": cloudwan_error})
+    else:
+        cloudwan_error = None
 
     # ─── VPC Endpoints ───
     endpoints = []
@@ -798,8 +811,11 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
         paginator = ec2.get_paginator("describe_vpc_endpoints")
         for page in paginator.paginate():
             endpoints.extend(page.get("VpcEndpoints", []))
-    except Exception:
-        pass
+    except Exception as e:
+        endpoints_error = str(e)
+        data_errors.append({"source": "ec2:DescribeVpcEndpoints", "error": endpoints_error})
+    else:
+        endpoints_error = None
 
     endpoint_summary = {}
     if endpoints:
@@ -849,8 +865,8 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
             "tunnels_total": sum(v["tunnels_total"] for v in vpn_details),
         },
         "vgw": vgw_details,
-        "cloud_wan": cloudwan,
-        "vpc_endpoints": endpoint_summary,
+        "cloud_wan": {"error": cloudwan_error} if cloudwan_error else cloudwan,
+        "vpc_endpoints": {"error": endpoints_error} if endpoints_error else endpoint_summary,
         "vpcs": {"total": len(vpcs)},
         "resiliency": _assess_architecture_resiliency(
             connections, vifs, gateways, tgws, tgw_attachments, vpn_details, vgw_details, cloudwan
@@ -863,6 +879,11 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
             "macsec_enabled": any(c.get("macSecKeys") for c in connections),
         },
         "cloudwatch_alarms": {
+            # Alarms could not be read: do not report recommended alarms as
+            # missing, since their absence was never observed.
+            "error": alarms_error,
+            "missing_recommended": None,
+        } if alarms_error else {
             "total_dx_alarms": len(all_dx_alarms),
             "alarms_in_alarm_state": [a for a in all_dx_alarms if a["state"] == "ALARM"],
             "alarms_in_ok_state": len([a for a in all_dx_alarms if a["state"] == "OK"]),
@@ -870,6 +891,7 @@ def network_architecture_summary(region: str = "us-east-1") -> str:
             "all_alarms": all_dx_alarms,
             "missing_recommended": _check_missing_alarms(connections, all_dx_alarms),
         },
+        "data_errors": data_errors,
     }
     return json.dumps(result, indent=2, default=str)
 

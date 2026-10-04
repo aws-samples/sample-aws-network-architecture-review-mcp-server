@@ -25,7 +25,7 @@ Any MCP-compatible client can use this server as a data source:
 - [Cursor](https://cursor.sh)
 - [VS Code + GitHub Copilot](https://code.visualstudio.com/)
 
-## Tools (14)
+## Tools (13)
 
 | Tool | Description |
 |------|-------------|

@@ -20,20 +20,6 @@ def get_client(service: str, region: str = "us-east-1"):
     return boto3.client(service, region_name=region)
 
 
-def _get_key(data: dict, camel: str) -> list | dict:
-    """Get a value from boto3 response handling both PascalCase and camelCase keys.
-    boto3 returns PascalCase for top-level response keys (e.g., TransitGateways)
-    but nested object fields remain camelCase (e.g., transitGatewayId).
-    """
-    # Try PascalCase first (boto3 default)
-    pascal = camel[0].upper() + camel[1:]
-    if pascal in data:
-        return data[pascal]
-    # Fallback to camelCase
-    if camel in data:
-        return data[camel]
-    return []
-
 
 # ─── Direct Connect Tools ───────────────────────────────────────────────────
 
@@ -49,7 +35,7 @@ def analyze_dx_topology(region: str = "us-east-1") -> str:
     """
     dx = get_client("directconnect", region)
 
-    connections = dx.describe_connections().get("connections", dx.describe_connections().get("Connections", []))
+    connections = dx.describe_connections().get("connections", [])
     vifs = dx.describe_virtual_interfaces().get("virtualInterfaces", [])
     gateways = dx.describe_direct_connect_gateways().get("directConnectGateways", [])
 
@@ -80,7 +66,7 @@ def check_dx_resiliency(region: str = "us-east-1") -> str:
     """
     dx = get_client("directconnect", region)
 
-    connections = dx.describe_connections().get("connections", dx.describe_connections().get("Connections", []))
+    connections = dx.describe_connections().get("connections", [])
     vifs = dx.describe_virtual_interfaces().get("virtualInterfaces", [])
     gateways = dx.describe_direct_connect_gateways().get("directConnectGateways", [])
 
@@ -562,7 +548,7 @@ def get_dx_cloudwatch_metrics(region: str = "us-east-1", connection_id: str = ""
     if connection_id:
         conn_ids = [connection_id]
     else:
-        connections = dx.describe_connections().get("connections", dx.describe_connections().get("Connections", []))
+        connections = dx.describe_connections().get("connections", [])
         conn_ids = [c["connectionId"] for c in connections if c.get("connectionState") == "available"]
 
     if not conn_ids:

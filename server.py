@@ -954,7 +954,8 @@ def _analyze_bgp(vifs):
         "total_peers": peers_total,
         "peers_up": peers_up,
         "peers_down": peers_down,
-        "health_pct": round((peers_up / peers_total * 100) if peers_total > 0 else 0, 1),
+        # None (JSON null) when there are no peers: "nothing to measure", not 0% healthy.
+        "health_pct": round(peers_up / peers_total * 100, 1) if peers_total > 0 else None,
         "down_peers": issues,
     }
 

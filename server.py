@@ -137,7 +137,7 @@ def get_dx_vif_details(region: str = "us-east-1", vif_id: str = "") -> str:
             "amazon_address": v.get("amazonAddress"),
             "customer_address": v.get("customerAddress"),
             "address_family": v.get("addressFamily"),
-            "amazon_side_asn": v.get("AmazonSideAsn"),
+            "amazon_side_asn": v.get("amazonSideAsn"),
             "customer_asn": v.get("asn"),
             "dx_gateway_id": v.get("directConnectGatewayId"),
             "virtual_gateway_id": v.get("virtualGatewayId"),
@@ -374,10 +374,10 @@ def get_virtual_gateway_details(region: str = "us-east-1") -> str:
             {
                 "vgw_id": v.get("VpnGatewayId"),
                 "name": _get_name_tag(v.get("Tags", [])),
-                "state": v.get("state"),
+                "state": v.get("State"),
                 "type": v.get("Type"),
                 "amazon_side_asn": v.get("AmazonSideAsn"),
-                "vpc_attachments": [{"vpc_id": a.get("vpcId"), "state": a.get("State")} for a in v.get("VpcAttachments", [])],
+                "vpc_attachments": [{"vpc_id": a.get("VpcId"), "state": a.get("State")} for a in v.get("VpcAttachments", [])],
             }
             for v in vgws
         ],
@@ -415,8 +415,8 @@ def analyze_cloudwan_topology(region: str = "us-east-1") -> str:
             "total_peerings": len(peerings),
             "attachments_by_type": _count_by_key(attachments, "AttachmentType"),
         },
-        "global_networks": [{"id": g.get("GlobalNetworkId"), "State": g.get("state"), "description": g.get("Description", "")} for g in global_networks],
-        "core_networks": [{"id": cn.get("CoreNetworkId"), "State": cn.get("state"), "description": cn.get("Description", "")} for cn in core_networks],
+        "global_networks": [{"id": g.get("GlobalNetworkId"), "state": g.get("State"), "description": g.get("Description", "")} for g in global_networks],
+        "core_networks": [{"id": cn.get("CoreNetworkId"), "state": cn.get("State"), "description": cn.get("Description", "")} for cn in core_networks],
         "attachments": [
             {
                 "attachment_id": a.get("AttachmentId"),
@@ -429,7 +429,7 @@ def analyze_cloudwan_topology(region: str = "us-east-1") -> str:
             for a in attachments
         ],
         "peerings": [
-            {"peering_id": p.get("PeeringId"), "peering_type": p.get("PeeringType"), "State": p.get("state"), "edge_location": p.get("EdgeLocation")}
+            {"peering_id": p.get("PeeringId"), "peering_type": p.get("PeeringType"), "state": p.get("State"), "edge_location": p.get("EdgeLocation")}
             for p in peerings
         ],
     }
@@ -507,15 +507,15 @@ def get_vpn_details(region: str = "us-east-1") -> str:
         tunnels = []
         for t in v.get("VgwTelemetry", []):
             tunnels.append({
-                "outside_ip": t.get("outsideIpAddress"),
-                "status": t.get("status"),
-                "status_message": t.get("statusMessage", ""),
-                "accepted_routes": t.get("acceptedRouteCount", 0),
+                "outside_ip": t.get("OutsideIpAddress"),
+                "status": t.get("Status"),
+                "status_message": t.get("StatusMessage", ""),
+                "accepted_routes": t.get("AcceptedRouteCount", 0),
             })
 
         vpn_details.append({
             "vpn_id": v.get("VpnConnectionId"),
-            "state": v.get("state"),
+            "state": v.get("State"),
             "type": v.get("Type"),
             "category": v.get("Category"),
             "tgw_id": v.get("TransitGatewayId"),
@@ -523,7 +523,7 @@ def get_vpn_details(region: str = "us-east-1") -> str:
             "customer_gateway_id": v.get("CustomerGatewayId"),
             "customer_gateway_ip": v.get("customerGatewayConfiguration", "")[:0],  # Don't expose config
             "tunnels": tunnels,
-            "static_routes": [r.get("DestinationCidrBlock") for r in v.get("routes", [])],
+            "static_routes": [r.get("DestinationCidrBlock") for r in v.get("Routes", [])],
             "tags": {tag["Key"]: tag["Value"] for tag in v.get("Tags", []) if tag.get("Key")},
         })
 
